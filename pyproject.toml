@@ -1,0 +1,51 @@
+[project]
+name = "pysql"
+version = "0.1.0"
+description = "A friendlier psql — an interactive PostgreSQL client that tells you a bit more."
+readme = "README.md"
+requires-python = ">=3.12"  # uses PEP 701 f-strings (backslashes in expressions)
+dependencies = [
+    "psycopg[binary]>=3.2",
+    "prompt_toolkit>=3.0",
+    "cryptography>=42.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# RDS IAM authentication (\C of an `auth = rds-iam` profile). Install with:
+#   uv sync --extra rds   (or  pip install "pysql[rds]")
+rds = ["boto3>=1.34"]
+
+[project.scripts]
+pysql = "pysql.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pysql"]
+
+[dependency-groups]
+dev = [
+    "ruff>=0.8",
+]
+# Toolchain for the standalone binary (scripts/build-binary.sh). Not needed at
+# runtime or to `uv tool install` — only to produce dist/pysql.
+build = [
+    "pyinstaller>=6.0",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src"]
+
+[tool.ruff.lint]
+# A focused, high-signal set: pyflakes/pycodestyle errors, import order,
+# pyupgrade, bugbear, and a few simplifications.
+select = ["E", "W", "F", "I", "UP", "B", "SIM"]
+ignore = [
+    "E501",    # line length is advisory here; `ruff format` handles code, not prose/strings
+    "SIM105",  # `contextlib.suppress` is not always clearer than try/except/pass
+]

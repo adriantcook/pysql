@@ -1,0 +1,12 @@
+# Raw asciinema recordings — they capture terminal metadata. Only the GIFs are published.
+*.cast
+
+# Python / uv
+__pycache__/
+*.py[cod]
+.venv/
+
+# Build output (uv build, scripts/build-binary.sh)
+dist/
+build/
+*.spec
