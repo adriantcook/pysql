@@ -24,6 +24,10 @@ and the full error diagnostics Postgres sends back.
 
 ![EXPLAIN ANALYZE showing a sequential scan, then an index scan after adding an index](demos/slow_cast.gif)
 
+**Spotting a lock holder with `\locks` and ending it with `\kl`**
+
+![\locks showing an idle-in-transaction session holding an AccessExclusive lock, then \kl terminating it and releasing the lock](demos/locks.gif)
+
 ## Install & run
 
 ```bash
@@ -43,8 +47,13 @@ Command-line flags:
 ```bash
 pysql @mydb-profile      # connect using a saved profile (see Connection profiles)
 pysql --enc [PASSWORD]    # print an encrypted token for a profile password, then exit
+pysql --profiles          # list saved profiles and the database each connects to, then exit
 pysql --help              # usage summary
 ```
+
+`--profiles` reads your profile file without connecting to anything, and shows
+each profile's name, database and `user@host:port` (plus `rds-iam` / `reader` /
+`⇄ ssm` markers where they apply). Passwords are never decrypted or printed.
 
 `--enc` is the one-shot equivalent of the in-prompt `\enc` — handy for scripting
 or when you're not already in a session. Pass the password inline (`pysql --enc
@@ -206,6 +215,12 @@ is really just muscle memory. Quitting pysql itself is still `\q` or `Ctrl-D`.
   the query, and — for waiters — which pid is **blocking** them
   (`pg_blocking_pids`). Great for spotting an `idle in transaction` holder
   stalling everyone else.
+- `\kl <pid>` — **kill a lock holder**: shows the table locks that pid holds and
+  which backends it's blocking, asks for confirmation, then terminates it
+  (`pg_terminate_backend`), which rolls back its transaction and releases all of
+  its locks. If the pid is itself *waiting* on someone else, it says so and
+  points you at the real blocker. Typical flow: `\locks` → spot the holder →
+  `\kl <pid>`.
 - `\top` — a snapshot of server activity from `pg_stat_activity`: a summary line
   (`N connections · A active · I idle · T idle in txn (max …)`) plus a table of
   the busy backends (pid, user, database, state, how long in that state, what
@@ -657,7 +672,8 @@ Done:
   per-connect), auto-managed **AWS SSM bastion tunnels** (`tunnel: {via: ssm, …}`,
   shown in `\C`), multiple open sessions at once, and `pysql @profile` launch
 - `~/.pysqlrc` for persistent settings (e.g. default the pager off)
-- `\locks` — live table-lock view with holders, waiters, and blocking pids
+- `\locks` — live table-lock view with holders, waiters, and blocking pids;
+  `\kl <pid>` terminates a holder after showing what it's blocking
 - `\dn` — list schemas, with the current one highlighted
 - `\dT <table>` — print a reconstructed `CREATE TABLE` statement (columns,
   constraints, indexes)

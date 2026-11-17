@@ -34,6 +34,7 @@ META_COMMANDS = [
     (r"\du", r"list roles & groups · \du <role> details one"),
     (r"\dp", r"object-access map · \dp <table|role> details one"),
     (r"\locks", "current table locks, holders, and blockers"),
+    (r"\kl", r"terminate a lock holder · \kl <pid>"),
     (r"\top", r"backend activity · \top <secs> live monitor"),
     (r"\cancel", r"cancel a running query · \cancel <pid>"),
     (r"\kill", r"terminate a backend/user · \kill <pid|user>"),

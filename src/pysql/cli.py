@@ -2966,6 +2966,98 @@ def _handle_locks(session: DBSession, state: dict) -> None:
     _emit(_locks_block(rows) + "\n", state, check_width=True)
 
 
+# Table locks one backend holds or is waiting for (same scope as \locks).
+_PID_LOCKS_SQL = """\
+SELECT n.nspname, c.relname, l.mode, l.granted
+FROM pg_catalog.pg_locks l
+JOIN pg_catalog.pg_class c ON c.oid = l.relation
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE l.locktype = 'relation' AND l.pid = %s
+  AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+ORDER BY l.granted DESC, n.nspname, c.relname;"""
+
+# Backends currently waiting on a lock held by the given pid.
+_BLOCKED_BY_PID_SQL = """\
+SELECT pid FROM pg_catalog.pg_stat_activity
+WHERE %s = ANY(pg_catalog.pg_blocking_pids(pid)) ORDER BY pid;"""
+
+
+def _handle_kill_locks(session: DBSession, args: list[str]) -> None:
+    """``\\kl <pid>`` — terminate a lock-holding backend, showing what it holds
+    and who it's blocking first. Terminating rolls back its transaction, which
+    releases every lock it holds (cancelling isn't enough for an idle-in-
+    transaction holder: there's no running query to cancel)."""
+    if not args:
+        print(_red(r"usage: \kl <pid>") + _dim(r"   (find holders with \locks)") + "\n")
+        return
+    try:
+        pid = int(args[0])
+    except ValueError:
+        print(_red(f"pid must be a number (got {args[0]!r}).") + "\n")
+        return
+    if pid == session.conn.info.backend_pid:
+        print(_red("That's this pysql session — use \\q to quit.") + "\n")
+        return
+
+    try:
+        with session.conn.cursor() as cur:
+            cur.execute(_SIGNAL_LOOKUP_SQL, (pid,))
+            backend = cur.fetchone()
+            cur.execute(_PID_LOCKS_SQL, (pid,))
+            locks = cur.fetchall()
+            cur.execute(_BLOCKED_BY_PID_SQL, (pid,))
+            blocked = [r[0] for r in cur.fetchall()]
+            cur.execute("SELECT pg_catalog.pg_blocking_pids(%s)", (pid,))
+            blockers = cur.fetchone()[0] or []
+    except psycopg.Error as exc:
+        _print_error(exc)
+        return
+    if backend is None:
+        print(_red(f"No backend with pid {pid}.") + "\n")
+        return
+    if not locks:
+        print(_red(f"pid {pid} holds no table locks in this database.")
+              + _dim(r"  (use \kill <pid> to end it anyway)") + "\n")
+        return
+
+    usename, datname, st, query = backend
+    print(_dim("Target: ") + f"pid {pid} · {usename or '?'}@{datname or '?'} · {st or '?'}")
+    if query and query != "<insufficient privilege>":
+        print(_dim("Query:  ") + _collapse(query, 70))
+    rows = []
+    for schema, tbl, mode, granted in locks:
+        name = tbl if schema == "public" else f"{schema}.{tbl}"
+        rows.append([name, mode.replace("Lock", ""), _green("held") if granted else _red("waiting")])
+    print(render_table(["table", "mode", "status"], rows, header_sgr=_header_sgr()))
+
+    if blocked:
+        print(_red(f"Blocking {len(blocked)} backend(s): ") + ", ".join(map(str, blocked)))
+    else:
+        print(_dim("Not blocking anyone right now."))
+    if blockers:
+        # Killing a waiter doesn't free anything — point at the real culprit.
+        print(_c(f"Note: pid {pid} is itself waiting on {', '.join(map(str, blockers))} — "
+                 f"killing it won't unblock anything; the holder is \\kl {blockers[0]}.", "33"))
+
+    if not _confirm(f"Terminate pid {pid} and release its locks? [y/N] "):
+        print(_dim("Aborted.") + "\n")
+        return
+    try:
+        with session.conn.cursor() as cur:
+            cur.execute("SELECT pg_catalog.pg_terminate_backend(%s)", (pid,))
+            ok = cur.fetchone()[0]
+    except psycopg.Error as exc:
+        _print_error(exc)
+        return
+    if not ok:
+        print(_red(f"Could not terminate backend {pid} — it may have already ended.") + "\n")
+        return
+    held = sum(1 for *_, granted in locks if granted)
+    msg = f"Terminated backend {pid} — released {held} table lock(s)"
+    msg += f", unblocking {', '.join(map(str, blocked))}." if blocked else "."
+    print(_green(msg) + "\n")
+
+
 # Grouped meta-command reference for \?. Left column is the bare command; the
 # description carries the argument forms (variants separated by " · ").
 _HELP_SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
@@ -2981,6 +3073,7 @@ _HELP_SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
     ]),
     ("Activity & locks", [
         (r"\locks", "current table locks, holders, and blockers"),
+        (r"\kl", r"\kl <pid> — end a lock holder (shows its locks & who it blocks)"),
         (r"\top", r"backend activity · \top <secs> live monitor w/ heatmap"),
         (r"\cancel", r"\cancel <pid> — cancel a running query"),
         (r"\kill", r"\kill <pid|user> end a backend · \killdb <db> all on a database"),
@@ -3137,6 +3230,8 @@ def _handle_meta(command: str, manager: SessionManager, state: dict) -> bool:
         _handle_privileges(session, args, state)
     elif cmd == r"\locks":
         _handle_locks(session, state)
+    elif cmd == r"\kl":
+        _handle_kill_locks(session, args)
     elif cmd == r"\top":
         _handle_top(session, state, args)
     elif cmd == r"\cancel":
@@ -3406,6 +3501,7 @@ def _print_usage() -> None:
         "  pysql [CONNINFO|URL]      connect using a libpq conninfo string or URL\n"
         "  pysql @PROFILE            connect using a saved profile\n"
         "  pysql --enc [PASSWORD]    print an encrypted token for a profile password\n"
+        "  pysql --profiles          list saved profiles and the database each connects to\n"
         "  pysql --help              show this help\n\n"
         "With no argument, pysql uses libpq defaults (PGHOST, PGDATABASE, PGUSER, … / .pgpass)."
     )
@@ -3440,11 +3536,51 @@ def _run_enc(argv: list[str]) -> int:
     return 0
 
 
+def _run_profiles() -> int:
+    """``pysql --profiles`` — list saved profiles without connecting to anything.
+
+    One line per profile: name, the database it connects to, then (dimmed) the
+    user@host:port it points at plus any auth/tunnel/reader markers. No passwords
+    are decrypted or shown.
+    """
+    path = active_profile_path()
+    profiles = load_profiles()
+    if not profiles:
+        print(_dim(f"No profiles in {path}") + "\n"
+              + _dim("  (connect, then \\add <name> to save one — see `pysql --help`)"))
+        return 0
+
+    print(_dim(f"Profiles ({path}):") + "\n")
+    names = sorted(profiles)
+    name_w = max(len(n) for n in names)
+    db_w = max(len(profiles[n].database or "?") for n in names)
+    for name in names:
+        p = profiles[name]
+        target = f"{p.username or '?'}@{p.hostname or 'local'}"
+        if p.port:
+            target += f":{p.port}"
+        tags = []
+        if p.auth == "rds-iam":
+            tags.append("rds-iam")
+        if p.reader:
+            tags.append("reader")
+        if p.tunnel:
+            tags.append("⇄ ssm")
+        if tags:
+            target += f"  [{', '.join(tags)}]"
+        db = p.database or "?"
+        print(f"  {_green(name.ljust(name_w))}   {_bold(db.ljust(db_w))}   {_dim(target)}")
+    print()
+    return 0
+
+
 def main() -> int:
     argv = sys.argv[1:]
     if argv and argv[0] in ("-h", "--help"):
         _print_usage()
         return 0
+    if argv and argv[0] == "--profiles":
+        return _run_profiles()
     if argv and (argv[0] == "--enc" or argv[0].startswith("--enc=")):
         return _run_enc(argv)
     arg = argv[0] if argv else ""
